@@ -94,11 +94,14 @@ def convert_pixtral_checkpoint(checkpoint_dir: str, checkpoint_name: str, vit_ty
     os.makedirs(pixtral_ckpt_dir, exist_ok=True)
     repo_id = "mistralai/Pixtral-12B-2409"
     print(f"Downloading {repo_id} to {pixtral_ckpt_dir}...")
+    # Use specific revision before max_position_embeddings was added to params.json
+    # to maintain compatibility with our config validation logic
     snapshot_download(
         repo_id=repo_id,
         allow_patterns=["params.json", "consolidated.safetensors"],
         local_dir=pixtral_ckpt_dir,
         local_dir_use_symlinks=False,
+        revision="db3e3ed01201248694fcb170c7bd292ecfcad22b"
     )
     orig_dtype = torch.get_default_dtype()
     dtype = torch.bfloat16
