@@ -37,6 +37,10 @@ Cosmos_Predict1_Text2World_7B_Multiview: LazyDict = LazyDict(
                 88,
                 160,
             ],
+            net=dict(
+                extra_per_block_abs_pos_emb=True,
+                extra_per_block_abs_pos_emb_type="sincos",
+            ),
             tokenizer=dict(
                 video_vae=dict(
                     pixel_chunk_duration=57,
