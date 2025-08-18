@@ -67,6 +67,8 @@ Cosmos_Predict1_Text2World_7B_Multiview_post_trained: LazyDict = LazyDict(
                 n_views=5,
                 view_condition_dim=3,
                 add_repeat_frame_embedding=False,
+                extra_per_block_abs_pos_emb=True,
+                extra_per_block_abs_pos_emb_type="sincos",
             ),
             latent_shape=[
                 16,
