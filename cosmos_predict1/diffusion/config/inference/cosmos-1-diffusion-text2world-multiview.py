@@ -37,6 +37,10 @@ Cosmos_Predict1_Text2World_7B_Multiview: LazyDict = LazyDict(
                 88,
                 160,
             ],
+            net=dict(
+                extra_per_block_abs_pos_emb=True,
+                extra_per_block_abs_pos_emb_type="sincos",
+            ),
             tokenizer=dict(
                 video_vae=dict(
                     pixel_chunk_duration=57,
@@ -59,10 +63,12 @@ Cosmos_Predict1_Text2World_7B_Multiview_post_trained: LazyDict = LazyDict(
             name="Cosmos_Predict1_Text2World_7B_Multiview_post_trained",
         ),
         model=dict(
-             net=dict(
+            net=dict(
                 n_views=5,
                 view_condition_dim=3,
-                add_repeat_frame_embedding=False, 
+                add_repeat_frame_embedding=False,
+                extra_per_block_abs_pos_emb=True,
+                extra_per_block_abs_pos_emb_type="sincos",
             ),
             latent_shape=[
                 16,

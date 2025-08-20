@@ -101,7 +101,7 @@ def convert_pixtral_checkpoint(checkpoint_dir: str, checkpoint_name: str, vit_ty
         allow_patterns=["params.json", "consolidated.safetensors"],
         local_dir=pixtral_ckpt_dir,
         local_dir_use_symlinks=False,
-        revision="db3e3ed01201248694fcb170c7bd292ecfcad22b"
+        revision="db3e3ed01201248694fcb170c7bd292ecfcad22b",
     )
     orig_dtype = torch.get_default_dtype()
     dtype = torch.bfloat16
