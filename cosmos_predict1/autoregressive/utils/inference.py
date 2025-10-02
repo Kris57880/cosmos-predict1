@@ -30,7 +30,7 @@ from cosmos_predict1.utils import log
 
 _IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", "webp"]
 _VIDEO_EXTENSIONS = [".mp4"]
-_SUPPORTED_CONTEXT_LEN = [1, 9]  # Input frames
+_SUPPORTED_CONTEXT_LEN = [1, 9, 17, 25, 33]  # Input frames
 NUM_TOTAL_FRAMES = 33
 
 
@@ -302,7 +302,22 @@ def load_videos_from_list(flist: List[str], data_resolution: List[int], num_inpu
 
             fname = os.path.basename(video_path)
             all_videos[fname] = video.transpose(0, 1).unsqueeze(0)
+        elif ext == ".yuv": # add for video compression
+            from .yuv_reader import read_yuv_to_tensor
+            # Read YUV video
+            H, W = data_resolution
+            frame_num = num_input_frames
+            video = read_yuv_to_tensor(video_path, H, W, frame_num, in_format='444', out_format='444', interpolation='bilinear')
+            video = video * 2 - 1  # Normalize to [-1, 1]
+            # Pad the video to NUM_TOTAL_FRAMES (because the tokenizer expects inputs of NUM_TOTAL_FRAMES)
+            video = torch.cat(
+                (video, video[-1, :, :, :].unsqueeze(0).repeat(NUM_TOTAL_FRAMES - num_input_frames, 1, 1, 1)),
+                dim=0,
+            )
 
+
+            fname = os.path.basename(video_path)
+            all_videos[fname] = video.transpose(0, 1).unsqueeze(0)
     return all_videos
 
 

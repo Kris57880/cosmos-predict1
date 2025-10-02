@@ -245,3 +245,6 @@ manifest.json
 wandb/
 onelogger.err
 onelogger.log
+checkpoints
+*.mp4
+*.png

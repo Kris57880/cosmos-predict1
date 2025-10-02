@@ -16,6 +16,7 @@
 import gc
 import os
 from typing import List, Optional, Tuple
+import math
 
 import numpy as np
 import torch
@@ -45,6 +46,13 @@ from cosmos_predict1.diffusion.inference.inference_utils import (
 from cosmos_predict1.utils import log, misc
 from cosmos_predict1.utils.base_world_generation_pipeline import BaseWorldGenerationPipeline
 
+from matplotlib import pyplot as plt
+from tqdm import trange
+import time
+
+NUM_TOTAL_FRAMES=33
+VIDEO_WIDTH=1024
+VIDEO_HEIGHT=640
 
 def detect_model_size_from_ckpt_path(ckpt_path: str) -> str:
     """Detect model size from checkpoint path.
@@ -123,12 +131,12 @@ def create_inference_config(
         tensor_model_parallel_size=parallel_size,
         rope_dim="3D",
         add_special_tokens=False,
-        pixel_chunk_duration=33,
-        num_video_frames=33,
+        pixel_chunk_duration=NUM_TOTAL_FRAMES,
+        num_video_frames=NUM_TOTAL_FRAMES,
         num_condition_latents_t=1,
         batch_size=batch_size,
-        video_height=640,
-        video_width=1024,
+        video_height=VIDEO_HEIGHT,
+        video_width=VIDEO_WIDTH,
         **kwargs,
     )
 
@@ -410,10 +418,9 @@ class ARBaseGenerationPipeline(BaseWorldGenerationPipeline):
 
         data_batch = {"video": inp_vid}
         data_batch = misc.to(data_batch, "cuda")
-
+        log.info(f"input video shape: {inp_vid.shape}")
         T, H, W = self.latent_shape
         num_gen_tokens = int(np.prod([T - latent_context_t_size, H, W]))
-
         out_videos_cur_batch, indices_tensor_cur_batch = self.generate_partial_tokens_from_data_batch(
             data_batch=data_batch,
             num_tokens_to_generate=num_gen_tokens,
@@ -717,8 +724,10 @@ class ARBaseGenerationPipeline(BaseWorldGenerationPipeline):
 
         stop_tokens = self.model.tokenizer.stop_tokens
         if self.offload_tokenizer:
+            log.info("offload tokenizer...")
             self._offload_tokenizer()
         if self.offload_network:
+            log.info("load autoregressive network...")
             self._load_network()
 
         generation_tokens, _ = self.model.generate(
@@ -736,6 +745,9 @@ class ARBaseGenerationPipeline(BaseWorldGenerationPipeline):
             verbose=True,
         )
         generation_tokens = generation_tokens[:, video_start_boundary:]
+
+
+        
         # Combine the tokens and do padding, sometimes the generated tokens end before the max_gen_len
         if generation_tokens.shape[1] < total_seq_len:
             log.warning(
@@ -770,6 +782,293 @@ class ARBaseGenerationPipeline(BaseWorldGenerationPipeline):
         # Normalize decoded video from [-1, 1] to [0, 1], and clip value
         video_decoded = (video_decoded * 0.5 + 0.5).clamp_(0, 1)
         return video_decoded, indices_tensor
+
+class ARVideoCompressPipeline(ARBaseGenerationPipeline):
+    """Video compression pipeline using autoregressive model.
+    Modify the base autoregressive pipeline for entropy coding of video tokens.
+    """
+
+    def __init__(
+        self,
+        checkpoint_dir: str,
+        checkpoint_name: str,
+        inference_type: str = None,
+        has_text_input: bool = True,
+        disable_diffusion_decoder: bool = False,
+        offload_guardrail_models: bool = False,
+        offload_diffusion_decoder: bool = False,
+        offload_network: bool = False,
+        offload_tokenizer: bool = False,
+        disable_guardrail: bool = False,
+        parallel_size: int = 1,
+    ):
+        """
+        Initialize ARVideoCompressPipeline for entropy coding.
+        """
+        log.info(f'offload_network: {offload_network}, offload_tokenizer: {offload_tokenizer}, offload_diffusion_decoder: {offload_diffusion_decoder}, disable_guardrail: {disable_guardrail}')
+
+        log.info(f"Before init, GPU memory allocated: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
+        super().__init__(
+            checkpoint_dir=checkpoint_dir,
+            checkpoint_name=checkpoint_name,
+            inference_type=inference_type,
+            has_text_input=has_text_input,
+            disable_diffusion_decoder=disable_diffusion_decoder,
+            offload_guardrail_models=offload_guardrail_models,
+            offload_diffusion_decoder=offload_diffusion_decoder,
+            offload_network=offload_network,
+            offload_tokenizer=offload_tokenizer,
+            disable_guardrail=disable_guardrail,
+            parallel_size=parallel_size,
+        )
+        log.info(f"After init, GPU memory allocated: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
+
+    def compress(self, inp_vid: torch.Tensor, buffer_frames: int, sampling_config: SamplingConfig, seed: int = 0, log_dir = 'log', entropy_coding=True) -> Tuple[np.ndarray, float]:
+        """
+        Compress a video using autoregressive entropy coding.
+        Args:
+            inp_vid: Input video tensor of shape (batch_size, time, channels=3, height, width)
+            buffer_frames: Number of buffer frames for context
+            sampling_config: Sampling configuration for AR model
+            seed: Random seed
+            enable_diffusion_decoder: Whether to apply diffusion decoder for enhanced reconstruction quality
+        Returns:
+            Tuple of (reconstructed video, bpp rate)
+        """
+        # Tokenize input video
+        log.info("Tokenize input video...")
+        _, _, video_frames, video_height, video_width = inp_vid.shape
+
+        if self.offload_tokenizer:
+            self._load_tokenizer()
+            log.info(f"Load tokenizer, GPU memory allocated: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
+
+        data_batch = {"video": inp_vid}
+        data_batch = misc.to(data_batch, "cuda")
+        data_tokens, token_boundaries = self.model.tokenizer.tokenize(data_batch=data_batch)
+        data_tokens = misc.to(data_tokens, "cuda").detach().clone()
+        log.info(f'Video shape: {inp_vid.shape}, latent token shape: {data_tokens.shape}')
+        
+        # del inp_vid , data_batch
+        # gc.collect()
+        # torch.cuda.empty_cache()
+        batch_size = data_tokens.shape[0]
+        video_token_start = self.tokenizer_config.video_tokenizer.tokenizer_offset
+        video_vocab_size = self.tokenizer_config.video_tokenizer.vocab_size
+        video_token_end = video_token_start + video_vocab_size
+        log.info(f'Vocabulary size: {video_vocab_size}')
+        logit_clipping_range = [video_token_start, video_token_end]
+        log.info(f'Logit clipping range: {logit_clipping_range}')
+        # Get video token boundaries
+        video_start = token_boundaries["video"][0][0]
+        video_end = token_boundaries["video"][0][1]
+        video_tokens = data_tokens[0][video_start:video_end]
+        len_video_tokens = video_end - video_start
+        log.info(f'Video tokens length: {len_video_tokens}, tokens: {video_tokens}')
+        
+        # Context window size
+        latent_context_t_size=0
+        for _clen in self._supported_context_len:
+            if buffer_frames >= _clen:
+                context_used = _clen
+                latent_context_t_size += 1
+        num_tokens = video_tokens.shape[0]
+        log.info(f"Buffer frames: {buffer_frames}, Supported context lengths: {self._supported_context_len}")
+    
+        T, H, W =  self.latent_shape
+        if entropy_coding:
+            max_tokens = latent_context_t_size*H*W
+            offset_tokens =  1*H*W # start prediction after getting first group of frames
+            log.info(f"Max_tokens {max_tokens}, latent_context_t_size T {latent_context_t_size}, H {H}, W {W}")
+            
+            # Initialize simplified entropy tracking
+            max_entropy = math.log2(video_vocab_size)
+            entropy_values = [max_entropy] * offset_tokens  # first group of frames entropy
+            window_size = 100
+            window_averages = []
+            
+            # Handle initial offset tokens with appropriate windowing
+            if offset_tokens > 0:
+                # If offset_tokens >= window_size, create multiple windows
+                if offset_tokens >= window_size:
+                    for i in range(0, offset_tokens, window_size):
+                        end_idx = min(i + window_size, offset_tokens)
+                        window_avg = max_entropy  # All offset tokens have the same entropy
+                        window_averages.append((end_idx - 1, window_avg))
+                        log.info(f"(No AR)Token {i}:{end_idx} average={window_avg:.4f}")
+                else:
+                    # Single window for all offset tokens
+                    initial_avg = max_entropy
+                    window_averages.append((offset_tokens - 1, initial_avg))
+                    log.info(f"Initial window for {offset_tokens} offset tokens: average={initial_avg:.4f}")
+            
+            if self.offload_tokenizer:
+                log.info(f"Before offload tokenizer, GPU memory allocated: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
+                log.info("offload tokenizer...")
+                self._offload_tokenizer()
+                log.info(f"After offload tokenizer, GPU memory allocated: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
+            if self.offload_network:
+                log.info("load autoregressive network...")
+                self._load_network()
+            
+            # Performance monitoring: record start time
+            start_time = torch.cuda.Event(enable_timing=True)
+            end_time = torch.cuda.Event(enable_timing=True)
+            log.info(f"Start entropy coding for {num_tokens} tokens...")
+            start_time.record()
+            # ar_start_time = torch.cuda.Event(enable_timing=True)
+            # ar_end_time = torch.cuda.Event(enable_timing=True)
+            # Stepwise entropy coding using AR model prediction function
+            for t in trange(offset_tokens, num_tokens):
+                # iter_start = time.time()    
+                # ========== Step 1: Context preparation ==========
+                # Use previous tokens as context, limited by context window
+                # Ensure start position is aligned to offset_tokens boundary
+                
+                # context_prep_start = time.time()
+                context_start = max(0, t - max_tokens)
+                context_start = (context_start // (1*H*W)) * (1*H*W) #align with full spatial tokens
+                context_tokens = video_tokens[context_start:t].detach().clone()
+                
+                # context_prep_time = time.time() - context_prep_start
+                
+                #========== Step 2: AR model prediction ==========
+                # ar_start_time.record()
+                # log.info(f"Before AR prediction: GPU memory allocated: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
+                prediction_result = self.model.predict_next_token_with_logits(
+                    prompt_tokens=context_tokens,
+                    temperature=1,  # deterministic for entropy coding
+                    context=None,
+                    context_mask=None,
+                    compile_prediction=True,  # Explicitly enable compilation acceleration
+                )
+                # ar_end_time.record()
+                # torch.cuda.synchronize()
+                # ar_duration = ar_start_time.elapsed_time(ar_end_time)
+
+                # ========== Step 3: Post-processing and entropy calculation ==========
+                true_token_idx = video_tokens[t] - logit_clipping_range[0]
+                prob_value = prediction_result["prob"][true_token_idx].item()
+                entropy_val = -math.log2(prob_value + 1e-9)
+                entropy_values.append(entropy_val)
+                
+                # Calculate window average every 100 tokens or at the end
+                current_length = len(entropy_values)
+                if current_length % window_size == 0 or t == num_tokens - 1:
+                    start_idx = max(0, current_length - window_size)
+                    window_avg = sum(entropy_values[start_idx:]) / (current_length - start_idx)
+                    window_averages.append((t, window_avg))
+                    log.info(f"Token {start_idx}:{current_length} average={window_avg:.4f}")
+            
+            # Remove the redundant initial window handling since we now handle it at initialization
+
+                # Detailed performance analysis for problematic iterations
+                # if total_time_ms > 100:
+                #     # Get GPU memory info
+                #     gpu_mem_allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+                #     gpu_mem_reserved = torch.cuda.memory_reserved() / 1024**3    # GB
+                    
+                #     log.warning(f"HIGH LATENCY at token {t}: total={total_time_ms:.2f}ms "
+                #                f"[context={context_prep_time*1000:.2f}ms, AR={ar_duration:.2f}ms, "
+                #                f"postproc={postproc_time*1000:.2f}ms, window={window_time*1000:.2f}ms] "
+                #                f"GPU_mem: {gpu_mem_allocated:.2f}GB alloc, {gpu_mem_reserved:.2f}GB reserved")
+                    
+                # if t == 1 or t % 500 == 0 or t == num_tokens - 1:
+                #     total_time_ms = (time.time() - iter_start) * 1000
+                #     gpu_mem = torch.cuda.memory_allocated() / 1024**3
+                #     log.info(f"Processed {t}/{num_tokens} tokens, "
+                #             f"Elapsed time: {total_time_ms:.2f}ms, GPU: {gpu_mem:.2f}GB (entropy deferred)")
+                    
+            
+                # Clean up memory every 50 tokens instead of every iteration
+                # if t % 50 == 0:
+                #     gc.collect()
+                #     torch.cuda.empty_cache()
+
+            # Post-processing: Calculate final statistics
+            log.info("Computing final entropy values...")
+            
+            # Performance monitoring: calculate total time and throughput  
+            end_time.record()
+            torch.cuda.synchronize()
+            total_time = start_time.elapsed_time(end_time) / 1000
+            tokens_per_second = (num_tokens - 1) / total_time
+            log.info(f"Entropy coding completed in {total_time:.2f}s")
+            log.info(f"Processing speed: {tokens_per_second:.2f} tokens/second")
+            log.info(f"Average time per token: {total_time/(num_tokens-1)*1000:.2f}ms")
+
+            # Calculate total entropy and bpp
+            total_entropy = sum(entropy_values)
+            
+            # Get original video dimensions for bpp calculation (pixels, not latent)
+            total_pixels = video_frames * video_height * video_width
+            log.info(f"Total Pixels = {total_pixels} = {video_frames} x {video_height} x {video_width}")
+
+            bpp = total_entropy / total_pixels
+            T, H, W = self.latent_shape
+            log.info(f"Compression bpp: {bpp:.4f}")
+            
+            # Plot entropy averages for every 100 tokens
+            if window_averages and len(entropy_values) > 0:
+                log.info("Plotting entropy averages for every 100 tokens...")
+                positions = [pos for pos, _ in window_averages]
+                averages = [avg for _, avg in window_averages]
+                
+                plt.figure(figsize=(12, 6))
+                plt.plot(positions, averages, 'b-o', linewidth=2, markersize=4, label=f'Average Entropy per {window_size} tokens')
+                overall_avg = sum(entropy_values) / len(entropy_values)
+                plt.axhline(y=overall_avg, color='r', linestyle='--', 
+                        label=f'Overall Average: {overall_avg:.3f}')
+                plt.xlabel('Token Position (End of Window)')
+                plt.ylabel('Average Entropy (bits)')
+                plt.title(f'Average Entropy per {window_size} Tokens over {num_tokens} Total Tokens')
+                plt.legend()
+                # plt.ylim(6, 22)
+                plt.ylim(0, 17)
+                plt.grid(True, alpha=0.3)
+                plt.tight_layout()
+                plt.savefig(f'{log_dir}/entropy_window_averages_{num_tokens}_tokens.png', dpi=150, bbox_inches='tight')
+                plt.close()
+                log.info(f"Saved entropy plot to {log_dir}/entropy_window_averages_{num_tokens}_tokens.png")
+
+            log.info("Finish entropy coding, decoding video...")
+            # Decode video for reconstruction
+            
+            if self.offload_tokenizer:
+                self._load_tokenizer()
+        else :
+            bpp = 0.0 # bpp is not calculated if entropy coding is disabled
+            log.info("Entropy coding disabled, skipping to decoding video...")
+        indices_tensor = video_tokens.unsqueeze(0)
+        indices_tensor = indices_tensor.long()
+        indices_tensor = rearrange(indices_tensor, "B (T H W) -> B T H W", T=T, H=H, W=W)
+        video_recon = self.model.tokenizer.video_tokenizer.decode(indices_tensor.cuda())
+        log.info(video_recon.shape)
+        
+        # Normalize decoded video from [-1, 1] to [0, 1]
+        video_recon = (video_recon * 0.5 + 0.5).clamp_(0, 1)
+        
+        # Optional diffusion decoder for enhanced quality
+        if not self.disable_diffusion_decoder:
+            log.info("Applying diffusion decoder for enhanced reconstruction quality...")
+            
+            # Prepare indices tensor for diffusion decoder
+            indices_tensor_dd = indices_tensor[0].clone()
+            
+            # Apply diffusion decoder enhancement
+            video_recon_enhanced = self._run_diffusion_decoder_with_offload(
+                out_videos_cur_batch=[video_recon[0]],
+                indices_tensor_cur_batch=[indices_tensor_dd], 
+                t5_emb_batch=[self.generic_prompt["context"]]  # Use generic prompt for compression
+            )
+            
+            video_recon = video_recon_enhanced[0]  # Use enhanced version
+            log.info("Diffusion decoder enhancement completed.")
+        else :
+            video_recon = video_recon[0]
+        video_recon = prepare_video_batch_for_saving([video_recon])[0]
+        
+        return video_recon,  bpp
 
 
 class ARVideo2WorldGenerationPipeline(ARBaseGenerationPipeline):

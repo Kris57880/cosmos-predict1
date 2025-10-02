@@ -192,3 +192,40 @@ def decode_n_tokens(
         return new_tokens, new_probs
     else:
         return new_tokens
+
+
+def predict_logits_and_probs(
+    model: Transformer,
+    prompt_tokens: torch.Tensor,
+    input_pos: torch.Tensor,
+    temperature: float = 1.0,
+    context: Optional[torch.Tensor] = None,
+    context_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Predict next token logits and probabilities for entropy coding.
+    This function is designed to be torch.compile compatible.
+    
+    Args:
+        model (Transformer): The transformer model.
+        prompt_tokens (torch.Tensor): Input prompt tokens.
+        input_pos (torch.Tensor): Input positions.
+        temperature (float): Temperature for probability computation.
+        context (Optional[torch.Tensor]): Optional context tensor.
+        context_mask (Optional[torch.Tensor]): Optional context mask.
+    
+    Returns:
+        prob_distribution (torch.Tensor): Probability distribution over the vocabulary for the next token.
+    """
+    with sdpa_kernel(SDPBackend.MATH):
+        # Forward through model to get logits
+        logits = model(tokens=prompt_tokens, input_pos=input_pos, context=context, context_mask=context_mask)
+        
+        # Get logits for the next token position (last position)
+        next_logits = logits[:, -1, :]
+        
+        # Compute probability distribution with temperature
+        prob = torch.softmax(next_logits / max(temperature, 1e-5), dim=-1)
+        
+        del logits, next_logits  # Free memory
+        return prob

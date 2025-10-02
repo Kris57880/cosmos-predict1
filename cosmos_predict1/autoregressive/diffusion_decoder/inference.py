@@ -32,6 +32,7 @@ def diffusion_decoder_process_tokens(
     original_video_example: torch.Tensor = None,
     t5_emb_batch: List[torch.Tensor] = None,
 ):
+    print(f'original_video_example shape: {original_video_example.shape}')
     _, T, H, W = original_video_example.shape
     if dd_sampling_config is None:
         dd_sampling_config = DiffusionDecoderSamplingConfig()

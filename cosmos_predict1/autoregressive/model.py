@@ -36,7 +36,7 @@ from cosmos_predict1.autoregressive.utils.checkpoint import (
     process_state_dict,
     substrings_to_ignore,
 )
-from cosmos_predict1.autoregressive.utils.sampling import decode_n_tokens, decode_one_token, prefill
+from cosmos_predict1.autoregressive.utils.sampling import decode_n_tokens, decode_one_token, prefill, predict_logits_and_probs
 from cosmos_predict1.utils import log, misc
 
 
@@ -375,6 +375,114 @@ class AutoRegressiveModel(torch.nn.Module):
         torch.set_default_dtype(orig_precision)  # Reset the default dtype to the original value
 
         return model_class(model, tokenizer, model_config, **model_kwargs)
+    
+    @torch.no_grad()
+    def predict_next_token_with_logits(
+        self,
+        prompt_tokens: List[int] | torch.Tensor,
+        temperature: float = 1.0,
+        context: Optional[torch.Tensor] = None,
+        context_mask: Optional[torch.Tensor] = None,
+        compile_prediction: bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Predict the next token given prompt tokens and return logits and probability for entropy coding.
+
+        Args:
+            prompt_tokens (List[int] | torch.Tensor): The prompt tokens (context sequence).
+            temperature (float): Sampling temperature for probability computation.
+            context (Optional[torch.Tensor]): Optional context tensor for cross-attention.
+            context_mask (Optional[torch.Tensor]): Optional context mask tensor.
+            compile_prediction (bool): Whether to use torch.compile for acceleration. Defaults to True.
+
+        Returns:
+            Dict[str, torch.Tensor]:
+                'logits': Raw logits for the next token (shape: [batch, vocab_size])
+                'prob': Probability distribution for the next token (shape: [batch, vocab_size])
+        """
+        
+        # Convert prompt_tokens to tensor if needed
+        if isinstance(prompt_tokens, list):
+            prompt_tokens = torch.tensor(prompt_tokens, dtype=torch.long, device="cuda")
+        if prompt_tokens.ndim == 1:
+            prompt_tokens = prompt_tokens.view(1, -1)
+        
+        batch_size, prompt_len = prompt_tokens.shape
+        input_pos = torch.arange(0, prompt_len, device="cuda")
+        # setup_time_s = torch.cuda.Event(enable_timing=True)
+        # setup_time_e = torch.cuda.Event(enable_timing=True)
+        # setup_time_s.record()
+
+        # Set precision
+        orig_precision = torch.get_default_dtype()
+        torch.set_default_dtype(self.precision)
+        
+        # Set up torch.compile configurations similar to generate function
+        torch._inductor.config.coordinate_descent_tuning = True
+        torch._inductor.config.triton.unique_kernel_names = True
+        torch._inductor.config.fx_graph_cache = True
+        torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = True
+
+        # Compile prediction function if requested and not already compiled
+        if compile_prediction and not getattr(self, "inference_prediction_compiled", False):
+            log.info("Compiling prediction function. Note: the first run will be slower due to compilation")
+            log.info(f"Before Compile, GPU memory allocated: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
+            self.predict_logits_and_probs = torch.compile(
+                predict_logits_and_probs, 
+                fullgraph=True, 
+                dynamic=True        
+            )
+            self.inference_prediction_compiled = True
+            log.info("Compiled prediction function.")
+            log.info(f"After Compile, GPU memory allocated: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
+        
+        # Use compiled or non-compiled version
+        if not hasattr(self, "predict_logits_and_probs"):
+            self.predict_logits_and_probs = predict_logits_and_probs
+
+        # setup_time_e.record()
+        # setup_time_e.synchronize()
+        # log.info(f"Setup time for prediction: {setup_time_s.elapsed_time(setup_time_e)} ms")
+        
+        # Process context and context_mask similar to generate function
+        if context is not None:
+            context = context.to(device=prompt_tokens.device, dtype=self.precision)
+        
+        if context_mask is not None:
+            context_mask = context_mask.to(dtype=torch.bool)
+            if context_mask.ndim == 2:
+                assert (
+                    context_mask.shape[0] == batch_size
+                ), f"batch_size mismatch: {context_mask.shape[0]} != {batch_size}"
+                # Unsqueeze it to make it of shape [batch_size, 1, 1, context_seq_len]
+                context_mask = context_mask.view(batch_size, 1, 1, -1)
+        
+        # model_forward_time_s = torch.cuda.Event(enable_timing=True)
+        # model_forward_time_e = torch.cuda.Event(enable_timing=True)
+        # model_forward_time_s.record()
+        # Use the compiled prediction function
+        # log.info(f"Before Model Forward, GPU memory allocated: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
+        prob = self.predict_logits_and_probs(
+            self.model,
+            prompt_tokens,
+            input_pos,
+            temperature,
+            context,
+            context_mask
+        )
+        # log.info(f"After Model Forward, GPU memory allocated: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
+        
+        # Get single batch probability (for compatibility with existing code)
+        prob_single = prob[0] if prob.shape[0] > 0 else prob
+
+        # model_forward_time_e.record()
+        # model_forward_time_e.synchronize()
+        # log.info(f"Model forward time: {model_forward_time_s.elapsed_time(model_forward_time_e)} ms")
+
+        # Reset precision
+        torch.set_default_dtype(orig_precision)
+        
+        return {"prob": prob_single.detach()}
 
     @torch.no_grad()
     def generate(
@@ -506,6 +614,8 @@ class AutoRegressiveModel(torch.nn.Module):
         empty[:, :prompt_len] = prompt_tokens
         seq = empty
         input_pos = torch.arange(0, prompt_len, device="cuda")
+        # prefill_start_cuda = torch.cuda.Event(enable_timing=True)
+        # prefill_end_cuda = torch.cuda.Event(enable_timing=True)
 
         if verbose:
             prefill_start = time.time()
@@ -519,7 +629,9 @@ class AutoRegressiveModel(torch.nn.Module):
         if context is not None:
             context = context.to(device=prompt_tokens.device, dtype=self.precision)
 
+        # prefill_start_cuda.record()
         # Prefill stage
+        log.info("Starting prefill stage")
         next_token = self.prefill(
             self.model,
             input_pos=input_pos,
@@ -531,9 +643,13 @@ class AutoRegressiveModel(torch.nn.Module):
             context=context,
             context_mask=context_mask,
         )
+        # prefill_end_cuda.record()
+        # torch.cuda.synchronize()
+        # prefill_time = prefill_start_cuda.elapsed_time(prefill_end_cuda) 
+        # log.info(f"Prefill time: {prefill_time} ms")
+        log.info("Completed prefill stage")
         if verbose:
             prefill_time = time.time() - prefill_start
-
         seq[:, [prompt_len]] = next_token.to(dtype=seq.dtype)
         input_pos = torch.tensor([prompt_len], dtype=torch.long, device="cuda")
         stop_tokens = self.tokenizer.stop_tokens if stop_tokens is None else stop_tokens
